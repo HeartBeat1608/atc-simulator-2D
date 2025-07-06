@@ -57,7 +57,7 @@ func NewGame(screenWidth, screenHeight int) *Game {
 }
 
 func (g *Game) Update() error {
-	dt := 1.0 / g.sim.TickRate
+	dt := 1.0 / float64(ebiten.TPS())
 	g.sim.Update(dt)
 
 	g.handleInput()
@@ -76,7 +76,19 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	}
 
 	g.drawUI(screen)
-	ebitenutil.DebugPrint(screen, "FPS: "+strconv.FormatFloat(ebiten.ActualFPS(), 'f', 2, 64))
+	g.drawStats(screen)
+}
+
+func (g *Game) drawStats(screen *ebiten.Image) {
+	statsString := fmt.Sprintf(
+		"FPS: %.2f\nTraffic: %d\nHandoffs: %d\nMissed Handoffs: %d",
+		ebiten.ActualFPS(),
+		len(g.sim.Aircrafts),
+		g.sim.HandOffs,
+		g.sim.MissedHandoffs,
+	)
+
+	ebitenutil.DebugPrintAt(screen, statsString, 10, 10)
 }
 
 func (g *Game) Layout(outsideWidth, outsideHeight int) (screenWidth, screenHeight int) {
@@ -86,23 +98,24 @@ func (g *Game) Layout(outsideWidth, outsideHeight int) (screenWidth, screenHeigh
 func (g *Game) handleInput() {
 	if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
 		x, y := ebiten.CursorPosition()
+		_, screenHeight := ebiten.WindowSize()
 
-		if g.commandInput.IsClicked(x, y) {
+		if g.commandInput.IsClicked(x, y, 10, screenHeight-40, 500, 30) {
 			g.commandInput.IsActive = true
 			return
 		} else {
 			g.commandInput.IsActive = false
 		}
 
-		clickedPos := types.NewVec2(float64(x), float64(y))
+		clickedWorldX, clickedWorldY := g.screenToWorld(float64(x), float64(y))
+		clickedPos := types.NewVec2(clickedWorldX, clickedWorldY)
 		g.selectedAircraftID = "" // Clear current selection
+		hitRadiusWorld := 15.0
 
 		// Check for aircraft hit
 		for _, ac := range g.sim.Aircrafts {
 			// A simple bounding box check (adjust size based on your aircraft sprite)
-			acWidth, acHeight := float64(g.aircraftImage.Bounds().Dx()), float64(g.aircraftImage.Bounds().Dy())
-			if clickedPos.X >= ac.Position.X-acWidth/2 && clickedPos.X <= ac.Position.X+acWidth/2 &&
-				clickedPos.Y >= ac.Position.Y-acHeight/2 && clickedPos.Y <= ac.Position.Y+acHeight/2 {
+			if clickedPos.DistanceTo(ac.Position) < hitRadiusWorld {
 				g.selectedAircraftID = ac.ID
 				log.Printf("Selected aircraft: %s", g.selectedAircraftID)
 				break
@@ -110,12 +123,8 @@ func (g *Game) handleInput() {
 		}
 	}
 
-	if ebiten.IsKeyPressed(ebiten.KeyH) && g.selectedAircraftID != "" {
-		if ac, ok := g.sim.Aircrafts[g.selectedAircraftID]; ok {
-			newHeading := math.Mod(ac.Heading+45, 360)
-			g.sim.IssueHeading(g.selectedAircraftID, newHeading)
-			log.Printf("%s: Turning to %.0f", g.selectedAircraftID, newHeading)
-		}
+	if ebiten.IsKeyPressed(ebiten.KeyF11) {
+		ebiten.SetFullscreen(!ebiten.IsFullscreen())
 	}
 
 	_, wy := ebiten.Wheel()
@@ -167,18 +176,13 @@ func (g *Game) worldToScreen(wx, wy float64) (sx, sy float64) {
 func (g *Game) drawAircraft(screen *ebiten.Image, ac *aircraft.Aircraft) {
 	screenX, screenY := g.worldToScreen(ac.Position.X, ac.Position.Y)
 
-	rotation := (ac.Heading - 0) * math.Pi / 100.0
+	rotation := ac.Heading * math.Pi / 180.0
 
 	op := &ebiten.DrawImageOptions{}
 	op.GeoM.Translate(-float64(g.aircraftImage.Bounds().Dx()/2), -float64(g.aircraftImage.Bounds().Dy()/2))
 	op.GeoM.Rotate(rotation)
 	op.GeoM.Scale(g.camera.Scale, g.camera.Scale)
 	op.GeoM.Translate(screenX, screenY)
-
-	if g.selectedAircraftID == ac.ID {
-		op.ColorScale.SetA(0.8)
-		vector.StrokeRect(screen, float32(ac.Position.X-10), float32(ac.Position.Y-10), 20, 20, 1, color.RGBA{255, 255, 255, 255}, false)
-	}
 
 	screen.DrawImage(g.aircraftImage, op)
 
@@ -187,18 +191,82 @@ func (g *Game) drawAircraft(screen *ebiten.Image, ac *aircraft.Aircraft) {
 	endWorldX := ac.Position.X + lineLength/g.camera.Scale*math.Sin(radians) // Calculate end point in world coords
 	endWorldY := ac.Position.Y - lineLength/g.camera.Scale*math.Cos(radians)
 	endScreenX, endScreenY := g.worldToScreen(endWorldX, endWorldY)
-	vector.StrokeLine(screen, float32(screenX), float32(screenY), float32(endScreenX), float32(endScreenY), 1, color.RGBA{100, 100, 255, 255}, false)
+	vector.StrokeLine(screen, float32(screenX), float32(screenY), float32(endScreenX), float32(endScreenY), float32(1*g.camera.Scale), color.RGBA{100, 100, 255, 255}, false)
 
-	tagText := fmt.Sprintf("%s\nALT:%.0f (%.0f)\nSPD:%.0f (%.0f)\nHDG:%.0f (%.0f)\nSTS: %s",
-		ac.ID, ac.Altitude, ac.TargetAltitude,
-		ac.Speed, ac.TargetSpeed,
-		ac.Heading, ac.TargetHeading, aircraft.StateStringMap[ac.State])
+	currentWayPoint := "-"
+	currentWayPointDistance := 10000.0
+	if ac.DirectToWaypoint != nil {
+		currentWayPoint = ac.DirectToWaypoint.Name
+		currentWayPointDistance = ac.Position.DistanceTo(ac.DirectToWaypoint.Position)
+	} else if ac.FlightPlan != nil && ac.FlightPlan.CurrentSegmentIndex < len(ac.FlightPlan.Route) {
+		wpName := ac.FlightPlan.Route[ac.FlightPlan.CurrentSegmentIndex].WaypointName
+		wp := g.sim.Airspace.Waypoints[wpName]
+		currentWayPoint = wp.Name
+		currentWayPointDistance = ac.Position.DistanceTo(wp.Position)
+	}
 
-	ebitenutil.DebugPrintAt(screen, tagText, int(ac.Position.X)+10, int(ac.Position.Y)-20)
+	tagText := ""
+	if currentWayPointDistance < 1000.0 {
+		tagText = fmt.Sprintf(
+			"%s\nALT:%.0f (%.0f)\nSPD:%.0f (%.0f)\nHDG:%.0f (%.0f)\nWP: %s (%.0f)\nSTS: %s",
+			ac.ID,
+			ac.Altitude,
+			ac.TargetAltitude,
+			ac.Speed,
+			ac.TargetSpeed,
+			ac.Heading,
+			ac.TargetHeading,
+			currentWayPoint,
+			currentWayPointDistance,
+			aircraft.StateStringMap[ac.State],
+		)
+	} else {
+		tagText = fmt.Sprintf(
+			"%s\nALT:%.0f (%.0f)\nSPD:%.0f (%.0f)\nHDG:%.0f (%.0f)\nWP: %s\nSTS: %s",
+			ac.ID,
+			ac.Altitude,
+			ac.TargetAltitude,
+			ac.Speed,
+			ac.TargetSpeed,
+			ac.Heading,
+			ac.TargetHeading,
+			currentWayPoint,
+			aircraft.StateStringMap[ac.State],
+		)
+	}
+
+	if tagText != "" {
+		ebitenutil.DebugPrintAt(screen, tagText, int(screenX)+10, int(screenY)-20)
+	}
+
+	if g.selectedAircraftID == ac.ID {
+		op.ColorScale.SetA(0.8)
+		highlightSize := 20.0 * g.camera.Scale
+		lineThickness := 2.0 * g.camera.Scale
+
+		vector.StrokeRect(
+			screen,
+			float32(screenX-highlightSize/2),
+			float32(screenY-highlightSize/2),
+			float32(highlightSize),
+			float32(highlightSize),
+			float32(lineThickness),
+			color.RGBA{0, 255, 0, 255},
+			false,
+		)
+	}
 
 	// Conflict highlight (also relative to screenX, screenY)
 	if ac.IsConflicting {
-		vector.DrawFilledCircle(screen, float32(screenX), float32(screenY), float32(10*g.camera.Scale), color.RGBA{255, 0, 0, 100}, false)
+		conflictingRadius := 10.0 * g.camera.Scale
+		vector.DrawFilledCircle(
+			screen,
+			float32(screenX),
+			float32(screenY),
+			float32(conflictingRadius),
+			color.RGBA{255, 0, 0, 100},
+			false,
+		)
 	}
 }
 
@@ -218,20 +286,50 @@ func (g *Game) drawAirspace(screen *ebiten.Image) {
 			p2World := sector.Bounds[(i+1)%len(sector.Bounds)]
 			p1ScreenX, p1ScreenY := g.worldToScreen(p1World.X, p1World.Y)
 			p2ScreenX, p2ScreenY := g.worldToScreen(p2World.X, p2World.Y)
-			vector.StrokeLine(screen, float32(p1ScreenX), float32(p1ScreenY), float32(p2ScreenX), float32(p2ScreenY), float32(1*g.camera.Scale), color.RGBA{0, 100, 0, 255}, false)
+			vector.StrokeLine(
+				screen,
+				float32(p1ScreenX),
+				float32(p1ScreenY),
+				float32(p2ScreenX),
+				float32(p2ScreenY),
+				float32(1*g.camera.Scale),
+				color.RGBA{100, 100, 100, 255},
+				false,
+			)
 		}
 	}
 }
 
 func (g *Game) drawUI(screen *ebiten.Image) {
-	g.commandInput.Draw(screen)
+	screenWidth, screenHeight := screen.Bounds().Dx(), screen.Bounds().Dy()
+	lineHeight := 22
+	lines := 1
 
-	selectedAcText := "Selected: None"
+	g.commandInput.Draw(screen, 10, screenHeight-40, screenWidth/2, 30)
+
+	selectedAcText := ""
 	if g.selectedAircraftID != "" {
-		selectedAcText = "Selected: " + string(g.selectedAircraftID)
+		if ac, ok := g.sim.Aircrafts[g.selectedAircraftID]; ok {
+			selectedAcText = fmt.Sprintf(
+				"AC: %s\nORIGIN: %s\nDEST: %s",
+				string(ac.FlightPlan.Callsign),
+				ac.FlightPlan.OriginAirportID,
+				ac.FlightPlan.DestinationAirportID,
+			)
+			lines += 3
+
+			filedPlan := []string{}
+			for _, seg := range ac.FlightPlan.Route {
+				filedPlan = append(filedPlan, seg.WaypointName)
+			}
+			selectedAcText += "\nFP: " + strings.Join(filedPlan, " -- ")
+			lines++
+		}
 	}
 
-	ebitenutil.DebugPrintAt(screen, selectedAcText, 10, 700)
+	if selectedAcText != "" {
+		ebitenutil.DebugPrintAt(screen, selectedAcText, 10, screenHeight-(lines*lineHeight))
+	}
 }
 
 func (g *Game) parseAndExecuteCommand(cmd string) {
@@ -270,24 +368,33 @@ func (g *Game) parseAndExecuteCommand(cmd string) {
 			log.Printf("Invalid heading value: %s. Must be 0-359.", valueStr)
 			return
 		}
-		g.sim.IssueHeading(aircraftID, heading)
-		log.Printf("Issued H %.0f to %s", heading, aircraftID)
+		if err = g.sim.IssueHeading(aircraftID, heading); err != nil {
+			log.Printf("Failed to Issue H %.0f to %s", heading, aircraftID)
+		} else {
+			log.Printf("Issued H %.0f to %s", heading, aircraftID)
+		}
 	case "A", "ALT", "ALTITUDE":
 		altitude, err := strconv.ParseFloat(valueStr, 64)
 		if err != nil || altitude < 0 { // Add more realistic altitude bounds
 			log.Printf("Invalid altitude value: %s. Must be positive.", valueStr)
 			return
 		}
-		g.sim.IssueAltitude(aircraftID, altitude)
-		log.Printf("Issued A %.0f to %s", altitude, aircraftID)
+		if err = g.sim.IssueAltitude(aircraftID, altitude); err != nil {
+			log.Printf("Failed to Issued A %.0f to %s", altitude, aircraftID)
+		} else {
+			log.Printf("Issued A %.0f to %s", altitude, aircraftID)
+		}
 	case "S", "SPD", "SPEED":
 		speed, err := strconv.ParseFloat(valueStr, 64)
 		if err != nil || speed < 0 { // Add realistic speed bounds
 			log.Printf("Invalid speed value: %s. Must be positive.", valueStr)
 			return
 		}
-		g.sim.IssueSpeed(aircraftID, speed)
-		log.Printf("Issued S %.0f to %s", speed, aircraftID)
+		if err = g.sim.IssueSpeed(aircraftID, speed); err != nil {
+			log.Printf("Failed to Issued S %.0f to %s", speed, aircraftID)
+		} else {
+			log.Printf("Issued S %.0f to %s", speed, aircraftID)
+		}
 	case "D", "DIRECT":
 		waypointName := strings.ToUpper(valueStr)
 		wp, ok := g.sim.Airspace.Waypoints[waypointName]
@@ -295,19 +402,23 @@ func (g *Game) parseAndExecuteCommand(cmd string) {
 			log.Printf("Waypoint %s not found.", waypointName)
 			return
 		}
-		g.sim.IssueDirectTo(aircraftID, wp)
-		log.Printf("Issued D %s to %s", waypointName, aircraftID)
+		if err := g.sim.IssueDirectTo(aircraftID, wp); err != nil {
+			log.Printf("Failed to Issued D %s to %s", waypointName, aircraftID)
+		} else {
+			log.Printf("Issued D %s to %s", waypointName, aircraftID)
+		}
 	default:
 		log.Printf("Unknown command type: %s", commandType)
 	}
 }
 
 func main() {
-	ebiten.SetWindowSize(1024, 768)
+	ebiten.SetWindowSize(1280, 720)
 	ebiten.SetWindowTitle("ATC Simulator")
 	ebiten.SetVsyncEnabled(true)
+	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 
-	game := NewGame(1024, 768)
+	game := NewGame(1280, 720)
 
 	if err := ebiten.RunGame(game); err != nil {
 		log.Fatal(err)

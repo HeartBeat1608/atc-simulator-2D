@@ -2,11 +2,16 @@ package flightplan
 
 import "atc-simulator/pkg/types"
 
+type FlightPlanSegment struct {
+	WaypointName   string
+	TargetAltitude float64
+	TargetSpeed    float64
+}
+
 type FlightPlan struct {
 	OriginAirportID      string
 	DestinationAirportID string
-	Route                []types.Waypoint // Sequence of waypoints
-	AssignedAltitude     float64
-	AssignedSpeed        float64
-	CurrentWaypointIndex int // Index of the next waypoint the aircraft is targeting
+	Route                []FlightPlanSegment // Sequence of segments
+	CurrentSegmentIndex  int
+	Callsign             types.AircraftID
 }

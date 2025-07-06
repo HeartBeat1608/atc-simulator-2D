@@ -6,6 +6,7 @@ import (
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	"github.com/hajimehoshi/ebiten/v2/vector"
 )
 
@@ -37,13 +38,13 @@ func (ti *TextInput) Update() {
 
 	ti.Text += string(ebiten.AppendInputChars(nil))
 
-	if ebiten.IsKeyPressed(ebiten.KeyBackspace) {
+	if inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
 		if len(ti.Text) > 0 {
 			ti.Text = ti.Text[:len(ti.Text)-1]
 		}
 	}
 
-	if ebiten.IsKeyPressed(ebiten.KeyEnter) {
+	if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
 		if ti.OnSubmit != nil {
 			ti.OnSubmit(strings.TrimSpace(ti.Text))
 		}
@@ -52,18 +53,18 @@ func (ti *TextInput) Update() {
 	}
 }
 
-func (ti *TextInput) Draw(screen *ebiten.Image) {
+func (ti *TextInput) Draw(screen *ebiten.Image, x, y, width, height int) {
 	bgColor := color.RGBA{50, 50, 50, 255}
 	if ti.IsActive {
 		bgColor = color.RGBA{80, 80, 80, 255} // Darker when active
 	}
-	vector.DrawFilledRect(screen, float32(ti.X), float32(ti.Y), float32(ti.Width), float32(ti.Height), bgColor, false)
+	vector.DrawFilledRect(screen, float32(x), float32(y), float32(width), float32(height), bgColor, false)
 
 	// Draw border
-	vector.DrawFilledRect(screen, float32(ti.X), float32(ti.Y), float32(ti.Width), 1, color.White, false)
-	vector.DrawFilledRect(screen, float32(ti.X), float32(ti.Y+ti.Height-1), float32(ti.Width), 1, color.White, false)
-	vector.DrawFilledRect(screen, float32(ti.X), float32(ti.Y), 1, float32(ti.Height), color.White, false)
-	vector.DrawFilledRect(screen, float32(ti.X+ti.Width-1), float32(ti.Y), 1, float32(ti.Height), color.White, false)
+	vector.DrawFilledRect(screen, float32(x), float32(y), float32(width), 1, color.White, false)
+	vector.DrawFilledRect(screen, float32(x), float32(y+height-1), float32(width), 1, color.White, false)
+	vector.DrawFilledRect(screen, float32(x), float32(y), 1, float32(height), color.White, false)
+	vector.DrawFilledRect(screen, float32(x+width-1), float32(y), 1, float32(height), color.White, false)
 
 	// Draw text
 	displayTxt := ti.Text
@@ -71,11 +72,11 @@ func (ti *TextInput) Draw(screen *ebiten.Image) {
 		displayTxt += "_" // Cursor
 	}
 
-	ebitenutil.DebugPrintAt(screen, displayTxt, ti.X+5, ti.Y+(ti.Height-16)/2) // Adjust for font height
+	ebitenutil.DebugPrintAt(screen, displayTxt, x+5, y+(height-16)/2)
 }
 
 // IsClicked checks if the mouse click is within the text input bounds
-func (ti *TextInput) IsClicked(mouseX, mouseY int) bool {
-	return mouseX >= ti.X && mouseX <= ti.X+ti.Width &&
-		mouseY >= ti.Y && mouseY <= ti.Y+ti.Height
+func (ti *TextInput) IsClicked(mouseX, mouseY, x, y, width, height int) bool {
+	return mouseX >= x && mouseX <= x+width &&
+		mouseY >= y && mouseY <= y+height
 }

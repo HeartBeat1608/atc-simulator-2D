@@ -3,7 +3,10 @@ package aircraft
 import (
 	"atc-simulator/internal/game/flightplan"
 	"atc-simulator/pkg/types"
+	"fmt"
+	"log"
 	"math"
+	"time"
 )
 
 type AircraftState int
@@ -16,16 +19,18 @@ const (
 	APPROACH
 	LANDED
 	TAKING_OFF
+	READY_FOR_HANDOFF
 )
 
 var StateStringMap = map[AircraftState]string{
-	CRUISE:     "CRUISE",
-	CLIMB:      "CLIMB",
-	DESCEND:    "DESCEND",
-	HOLDING:    "HOLDING",
-	APPROACH:   "APPROACH",
-	LANDED:     "LANDED",
-	TAKING_OFF: "TAKING_OFF",
+	CRUISE:            "CRUISE",
+	CLIMB:             "CLIMB",
+	DESCEND:           "DESCEND",
+	HOLDING:           "HOLDING",
+	APPROACH:          "APPROACH",
+	LANDED:            "LANDED",
+	TAKING_OFF:        "TAKING_OFF",
+	READY_FOR_HANDOFF: "READY_FOR_HANDOFF",
 }
 
 type Aircraft struct {
@@ -50,17 +55,26 @@ type Aircraft struct {
 
 	IsConflicting bool
 	FlightPlan    *flightplan.FlightPlan
+
+	GetWaypoint         func(string) (*types.Waypoint, bool)
+	AddRadioMessageFunc func(callsign types.AircraftID, message string, isUrgent bool)
+
+	LastRadioTime           time.Time
+	MessageDebounceTime     time.Duration
+	PreviousAltitudeRequest bool
+	PreviousSpeedRequest    bool
+	PreviousWaypointReached string
 }
 
-func NewAircraft(id types.AircraftID, pos types.Vec2, heading, speed, altitude float64, state AircraftState, route []types.Waypoint) *Aircraft {
-	return &Aircraft{
+func NewAircraft(id types.AircraftID, pos types.Vec2, heading, speed, altitude float64, state AircraftState, flightPlan *flightplan.FlightPlan, getWaypoint func(string) (*types.Waypoint, bool), addRadioMessageFunc func(types.AircraftID, string, bool)) *Aircraft {
+	ac := &Aircraft{
 		ID:                          id,
 		Position:                    pos,
 		Altitude:                    altitude,
 		Heading:                     heading,
 		Speed:                       speed,
 		ClimbRate:                   0,
-		TargetAltitude:              altitude, // Initial target is current altitude
+		TargetAltitude:              altitude,
 		TargetSpeed:                 speed,
 		TargetHeading:               heading,
 		State:                       state,
@@ -68,7 +82,18 @@ func NewAircraft(id types.AircraftID, pos types.Vec2, heading, speed, altitude f
 		MaxClimbRateFPM:             3000.0,
 		MaxDescentRateFPM:           -2500.0,
 		AccelerationRateKnotsPerSec: 10.0 / 60.0,
+		GetWaypoint:                 getWaypoint,
+		FlightPlan:                  flightPlan,
+		LastRadioTime:               time.Now(),
+		MessageDebounceTime:         5 * time.Second,
+		AddRadioMessageFunc:         addRadioMessageFunc,
 	}
+
+	if ac.AddRadioMessageFunc != nil {
+		ac.AddRadioMessageFunc(ac.ID, fmt.Sprintf("Requesting clearance to %s", ac.FlightPlan.DestinationAirportID), false)
+	}
+
+	return ac
 }
 
 func (ac *Aircraft) Update(dt float64) {
@@ -100,18 +125,36 @@ func (ac *Aircraft) Update(dt float64) {
 	}
 
 	if ac.DirectToWaypoint != nil {
-		dx := ac.DirectToWaypoint.Position.X - ac.Position.X
-		dy := ac.DirectToWaypoint.Position.Y - ac.Position.Y
-		targetBearing := math.Atan2(dx, -dy) * 180.0 / math.Pi
-		targetBearing = math.Mod(targetBearing+360, 360)
-
-		// log.Printf("DIRECT TO WAYPT: %s | bearing %.0f | current %.0f", ac.DirectToWaypoint.Name, targetBearing, ac.Heading)
-
-		if ac.Position.DistanceTo(ac.DirectToWaypoint.Position) < 20 {
+		if ac.Position.DistanceTo(ac.DirectToWaypoint.Position) < 30 {
 			ac.DirectToWaypoint = nil
+
+			ac.FlightPlan.CurrentSegmentIndex++
+			if ac.FlightPlan.CurrentSegmentIndex >= len(ac.FlightPlan.Route) {
+				log.Printf("%s completed its flight plan in this sector.", ac.ID)
+				ac.State = READY_FOR_HANDOFF
+			}
 			ac.TargetHeading = ac.Heading
 		} else {
-			ac.TargetHeading = targetBearing
+			ac.TargetHeading = ac.Position.HeadingTo(ac.DirectToWaypoint.Position)
+		}
+	}
+
+	if ac.DirectToWaypoint == nil && ac.FlightPlan != nil && ac.FlightPlan.CurrentSegmentIndex < len(ac.FlightPlan.Route) {
+		nextSegment := ac.FlightPlan.Route[ac.FlightPlan.CurrentSegmentIndex]
+		nextWaypoint, ok := ac.GetWaypoint(nextSegment.WaypointName)
+		if ok {
+			ac.SetDirectTo(nextWaypoint)
+
+			if ac.TargetAltitude == ac.Altitude {
+				ac.SetAltitude(nextSegment.TargetAltitude)
+			}
+			if ac.TargetSpeed == ac.Speed {
+				ac.SetSpeed(nextSegment.TargetSpeed)
+			}
+
+			log.Printf("%s now directing to %s (Segment %d)", ac.ID, nextSegment.WaypointName, ac.FlightPlan.CurrentSegmentIndex)
+		} else {
+			log.Printf("ERROR: Waypoint %s not found for %s's flight plan segment %d", nextSegment.WaypointName, ac.ID, ac.FlightPlan.CurrentSegmentIndex)
 		}
 	}
 
@@ -148,6 +191,45 @@ func (ac *Aircraft) Update(dt float64) {
 
 	ac.Position.X += pixelsPerSec * math.Sin(radians) * dt
 	ac.Position.Y -= pixelsPerSec * math.Cos(radians) * dt
+
+	// Radio communication logic
+	if time.Since(ac.LastRadioTime) > ac.MessageDebounceTime {
+		// Altitude requests
+		if ac.TargetAltitude > ac.Altitude+100 && !ac.PreviousAltitudeRequest { // Target higher
+			ac.AddRadioMessageFunc(ac.ID, fmt.Sprintf("Requesting higher to FL%.0f", ac.TargetAltitude/100), false)
+			ac.PreviousAltitudeRequest = true
+			ac.LastRadioTime = time.Now()
+		} else if ac.TargetAltitude < ac.Altitude-100 && !ac.PreviousAltitudeRequest { // Target lower
+			ac.AddRadioMessageFunc(ac.ID, fmt.Sprintf("Requesting lower to FL%.0f", ac.TargetAltitude/100), false)
+			ac.PreviousAltitudeRequest = true
+			ac.LastRadioTime = time.Now()
+		} else if math.Abs(ac.TargetAltitude-ac.Altitude) < 100 { // Reached target altitude
+			ac.PreviousAltitudeRequest = false // Reset request state
+		}
+
+		// Speed requests (similar logic)
+		if math.Abs(ac.TargetSpeed-ac.Speed) > 50 && !ac.PreviousSpeedRequest {
+			// ac.AddRadioMessageFunc(ac.ID, fmt.Sprintf("Requesting speed %.0f knots", ac.TargetSpeed), false)
+			// ac.PreviousSpeedRequest = true
+			// ac.LastRadioTime = time.Now()
+		} else if math.Abs(ac.TargetSpeed-ac.Speed) < 10 {
+			ac.PreviousSpeedRequest = false
+		}
+
+	}
+
+	// Waypoint Reached Report (should be less frequent, maybe not debounced by general message time)
+	// This typically happens when DirectToWaypoint is reset.
+	// So this logic will move into the DirectToWaypoint reached block.
+	if ac.DirectToWaypoint == nil && ac.FlightPlan != nil && ac.FlightPlan.CurrentSegmentIndex > 0 &&
+		ac.FlightPlan.CurrentSegmentIndex-1 < len(ac.FlightPlan.Route) { // Ensure index is valid for prev segment
+		prevWpName := ac.FlightPlan.Route[ac.FlightPlan.CurrentSegmentIndex-1].WaypointName
+		if ac.PreviousWaypointReached != prevWpName {
+			ac.AddRadioMessageFunc(ac.ID, fmt.Sprintf("Approaching %s", prevWpName), false) // Report reaching, or approaching next
+			ac.PreviousWaypointReached = prevWpName
+			ac.LastRadioTime = time.Now() // Debounce here too
+		}
+	}
 }
 
 func (ac *Aircraft) SetHeading(h float64) {

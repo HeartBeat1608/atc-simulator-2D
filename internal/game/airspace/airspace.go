@@ -1,6 +1,10 @@
 package airspace
 
-import "atc-simulator/pkg/types"
+import (
+	"atc-simulator/pkg/types"
+
+	"github.com/hajimehoshi/ebiten/v2"
+)
 
 type Sector struct {
 	Name        string
@@ -13,6 +17,9 @@ type Airspace struct {
 	Waypoints map[string]*types.Waypoint
 	Sectors   map[string]*Sector
 	Runways   map[string]*types.Vec2
+
+	ExitWaypoints  []string
+	EntryWaypoints []string
 }
 
 func NewAirspace() *Airspace {
@@ -20,12 +27,18 @@ func NewAirspace() *Airspace {
 		Waypoints: make(map[string]*types.Waypoint),
 		Sectors:   make(map[string]*Sector),
 		Runways:   make(map[string]*types.Vec2),
+
+		EntryWaypoints: []string{"APIPO", "BISKET", "EMETI", "FILKA"},
+		ExitWaypoints:  []string{"APIPO", "BISKET", "EMETI", "FILKA"},
 	}
 
-	ap.Waypoints["WAYPT1"] = &types.Waypoint{Name: "WAYPT1", Position: types.NewVec2(200, 200)}
-	ap.Waypoints["WAYPT2"] = &types.Waypoint{Name: "WAYPT2", Position: types.NewVec2(800, 200)}
-	ap.Waypoints["WAYPT3"] = &types.Waypoint{Name: "WAYPT3", Position: types.NewVec2(800, 600)}
-	ap.Waypoints["WAYPT4"] = &types.Waypoint{Name: "WAYPT4", Position: types.NewVec2(200, 600)}
+	screenWidth, screenHeight := ebiten.WindowSize()
+
+	ap.Waypoints["APIPO"] = &types.Waypoint{Name: "APIPO", Position: types.NewVec2(float64(screenWidth)*0.1, float64(screenHeight)*0.14)}
+	ap.Waypoints["BISKET"] = &types.Waypoint{Name: "BISKET", Position: types.NewVec2(float64(screenWidth)*0.64, float64(screenHeight)*0.23)}
+	ap.Waypoints["CIPKA"] = &types.Waypoint{Name: "CIPKA", Position: types.NewVec2(float64(screenWidth)*0.37, float64(screenHeight)*0.54)}
+	ap.Waypoints["EMETI"] = &types.Waypoint{Name: "EMETI", Position: types.NewVec2(float64(screenWidth)*0.25, float64(screenHeight)*0.90)}
+	ap.Waypoints["FILKA"] = &types.Waypoint{Name: "FILKA", Position: types.NewVec2(float64(screenWidth)*0.67, float64(screenHeight)*0.65)}
 
 	// Example: Define a simple rectangular sector
 	ap.Sectors["SECTOR1"] = &Sector{

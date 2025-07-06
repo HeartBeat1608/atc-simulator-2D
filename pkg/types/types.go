@@ -19,6 +19,20 @@ func (v1 Vec2) DistanceTo(v2 Vec2) float64 {
 	return math.Sqrt(dx*dx + dy*dy)
 }
 
+func (v Vec2) HeadingTo(target Vec2) float64 {
+	dx := target.X - v.X
+	dy := target.Y - v.Y
+
+	angleFromPositiveX := math.Atan2(dy, dx)
+
+	angleDegrees := angleFromPositiveX * 180.0 / math.Pi
+
+	aviationHeading := angleDegrees + 90
+
+	normalizedHeading := math.Mod(aviationHeading+360.0, 360.0)
+	return normalizedHeading
+}
+
 type Waypoint struct {
 	Name     string
 	Position Vec2
