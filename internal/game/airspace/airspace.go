@@ -16,7 +16,7 @@ type Sector struct {
 type Airspace struct {
 	Waypoints map[string]*types.Waypoint
 	Sectors   map[string]*Sector
-	Runways   map[string]*types.Vec2
+	Airports  map[string]*Airport
 
 	ExitWaypoints  []string
 	EntryWaypoints []string
@@ -26,7 +26,7 @@ func NewAirspace() *Airspace {
 	ap := &Airspace{
 		Waypoints: make(map[string]*types.Waypoint),
 		Sectors:   make(map[string]*Sector),
-		Runways:   make(map[string]*types.Vec2),
+		Airports:  make(map[string]*Airport),
 
 		EntryWaypoints: []string{"APIPO", "BISKET", "EMETI", "FILKA"},
 		ExitWaypoints:  []string{"APIPO", "BISKET", "EMETI", "FILKA"},

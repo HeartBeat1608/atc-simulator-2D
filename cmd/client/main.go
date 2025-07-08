@@ -43,6 +43,9 @@ func NewGame(screenWidth, screenHeight int) *Game {
 		height: screenHeight,
 	}
 
+	game.sim.WorldToScreen = game.worldToScreen
+	game.sim.ScreenToWorld = game.screenToWorld
+
 	var err error
 	game.aircraftImage, _, err = ebitenutil.NewImageFromFile("internal/assets/images/aircraft.png")
 	if err != nil {
@@ -77,12 +80,14 @@ func (g *Game) Draw(screen *ebiten.Image) {
 
 	g.drawUI(screen)
 	g.drawStats(screen)
+	g.drawRadioComms(screen, 100)
 }
 
 func (g *Game) drawStats(screen *ebiten.Image) {
 	statsString := fmt.Sprintf(
-		"FPS: %.2f\nTraffic: %d\nHandoffs: %d\nMissed Handoffs: %d",
+		"FPS: %.2f\nScale: %.2f\nTraffic: %d\nHandoffs: %d\nMissed Handoffs: %d",
 		ebiten.ActualFPS(),
+		g.camera.Scale,
 		len(g.sim.Aircrafts),
 		g.sim.HandOffs,
 		g.sim.MissedHandoffs,
@@ -117,7 +122,7 @@ func (g *Game) handleInput() {
 			// A simple bounding box check (adjust size based on your aircraft sprite)
 			if clickedPos.DistanceTo(ac.Position) < hitRadiusWorld {
 				g.selectedAircraftID = ac.ID
-				log.Printf("Selected aircraft: %s", g.selectedAircraftID)
+				// log.Printf("Selected aircraft: %s", g.selectedAircraftID)
 				break
 			}
 		}
@@ -278,6 +283,38 @@ func (g *Game) drawAirspace(screen *ebiten.Image) {
 		ebitenutil.DebugPrintAt(screen, wp.Name, int(screenX)+5, int(screenY)+5)
 	}
 
+	// Draw Airports and Runways
+	for _, airport := range g.sim.Airspace.Airports {
+		airportScreenX, airportScreenY := g.worldToScreen(airport.Position.X, airport.Position.Y)
+		vector.DrawFilledCircle(screen, float32(airportScreenX), float32(airportScreenY), float32(5*g.camera.Scale), color.RGBA{255, 255, 0, 255}, false)
+		ebitenutil.DebugPrintAt(screen, airport.ID, int(airportScreenX)+8, int(airportScreenY)+8)
+
+		for _, rwy := range airport.Runways {
+			lineLength := 150.0
+			lineThickness := 2.0 * g.camera.Scale
+
+			rwyRadians := rwy.Heading * math.Pi / 180.0
+
+			halfLenX := (lineLength / 2) * math.Sin(rwyRadians)
+			halfLenY := (lineLength / 2) * math.Cos(rwyRadians)
+
+			p1WorldX := rwy.Threshold.X - halfLenX
+			p1WorldY := rwy.Threshold.Y + halfLenY
+
+			p2WorldX := rwy.Threshold.X + halfLenX
+			p2WorldY := rwy.Threshold.Y - halfLenY
+
+			p1ScreenX, p1ScreenY := g.worldToScreen(p1WorldX, p1WorldY)
+			p2ScreenX, p2ScreenY := g.worldToScreen(p2WorldX, p2WorldY)
+
+			vector.StrokeLine(screen, float32(p1ScreenX), float32(p1ScreenY), float32(p2ScreenX), float32(p2ScreenY), float32(lineThickness), color.RGBA{200, 200, 200, 255}, false)
+
+			// Draw runway name/number at threshold
+			thresholdScreenX, thresholdScreenY := g.worldToScreen(rwy.Threshold.X, rwy.Threshold.Y)
+			ebitenutil.DebugPrintAt(screen, rwy.Name, int(thresholdScreenX)+5, int(thresholdScreenY)-15)
+		}
+	}
+
 	// Convert Sector bounds
 	sector := g.sim.Airspace.Sectors["SECTOR1"]
 	if sector != nil && len(sector.Bounds) >= 2 {
@@ -320,7 +357,11 @@ func (g *Game) drawUI(screen *ebiten.Image) {
 
 			filedPlan := []string{}
 			for _, seg := range ac.FlightPlan.Route {
-				filedPlan = append(filedPlan, seg.WaypointName)
+				wpName := seg.WaypointName
+				if ac.FlightPlan.CurrentSegmentIndex < len(ac.FlightPlan.Route) && ac.DirectToWaypoint != nil && ac.DirectToWaypoint.Name == seg.WaypointName {
+					wpName = "* " + wpName
+				}
+				filedPlan = append(filedPlan, wpName)
 			}
 			selectedAcText += "\nFP: " + strings.Join(filedPlan, " -- ")
 			lines++
@@ -329,6 +370,54 @@ func (g *Game) drawUI(screen *ebiten.Image) {
 
 	if selectedAcText != "" {
 		ebitenutil.DebugPrintAt(screen, selectedAcText, 10, screenHeight-(lines*lineHeight))
+	}
+}
+
+func (g *Game) drawRadioComms(screen *ebiten.Image, yOffset int) {
+	radioLogX := 5
+	radioLogY := yOffset
+	lineHeight := 22
+
+	numMessagesToShow := 10
+	startIndex := 0
+	if len(g.sim.RadioLog) > numMessagesToShow {
+		startIndex = len(g.sim.RadioLog) - numMessagesToShow
+	}
+
+	for i := startIndex; i < len(g.sim.RadioLog); i++ {
+		msg := g.sim.RadioLog[i]
+		callSign := msg.Callsign
+		if msg.IsUrgent {
+			callSign = "+" + msg.Callsign
+		}
+		displayLine := fmt.Sprintf("[%s] %s: %s", msg.Timestamp.Format("15:04:05"), callSign, msg.Message)
+		ebitenutil.DebugPrintAt(screen, displayLine, radioLogX, radioLogY+(i-startIndex)*lineHeight)
+	}
+}
+
+func (g *Game) handleHandoffCommand(callsign types.AircraftID) {
+	if ac, ok := g.sim.Aircrafts[callsign]; ok {
+		if g.sim.ClearHandoff(ac.ID) {
+			g.sim.AddRadioMessage(ac.ID, "Roger, good day.", false)
+			log.Printf("ATC issued HANDOFF to %s", callsign)
+		} else {
+			g.sim.AddRadioMessage("ATC", fmt.Sprintf("Unable to clear %s for handoff: not ready or already handed off.", callsign), true)
+		}
+	} else {
+		log.Printf("Aircraft %s not found for HANDOFF command.", callsign)
+	}
+}
+
+func (g *Game) handleLandingCommand(callsign types.AircraftID, runwayName string) {
+	if ac, ok := g.sim.Aircrafts[callsign]; ok {
+		if g.sim.ClearLanding(ac.ID, runwayName) {
+			g.sim.AddRadioMessage(ac.ID, fmt.Sprintf("Cleared to land runway %s, roger.", runwayName), false) // Aircraft acknowledges
+			log.Printf("ATC issued LANDING clearance to %s for %s", callsign, runwayName)
+		} else {
+			g.sim.AddRadioMessage("ATC", fmt.Sprintf("Unable to clear %s for landing on %s: runway invalid or aircraft not ready.", callsign, runwayName), true)
+		}
+	} else {
+		log.Printf("Aircraft %s not found for LANDING command.", callsign)
 	}
 }
 
@@ -362,6 +451,13 @@ func (g *Game) parseAndExecuteCommand(cmd string) {
 	}
 
 	switch commandType {
+	// case "SEL", "SELECT":
+	// 	if valueStr != "" {
+	// 		g.handleSelectCommand(types.AircraftID(valueStr))
+	// 	} else {
+	// 		log.Printf("Invalid SELECT command. Usage: SEL <callsign>")
+	// 	}
+
 	case "H", "HEADING":
 		heading, err := strconv.ParseFloat(valueStr, 64)
 		if err != nil || heading < 0 || heading >= 360 {
@@ -374,7 +470,20 @@ func (g *Game) parseAndExecuteCommand(cmd string) {
 			log.Printf("Issued H %.0f to %s", heading, aircraftID)
 		}
 	case "A", "ALT", "ALTITUDE":
-		altitude, err := strconv.ParseFloat(valueStr, 64)
+		var altitude float64
+		var err error
+
+		if strings.HasPrefix(valueStr, "FL") {
+			if val, ok := strings.CutPrefix(valueStr, "FL"); ok {
+				altitude, err = strconv.ParseFloat(val, 64)
+				altitude = altitude * 100.0 // convert flight level to feets
+			} else {
+				altitude, err = strconv.ParseFloat(valueStr, 64)
+			}
+		} else {
+			altitude, err = strconv.ParseFloat(valueStr, 64)
+		}
+
 		if err != nil || altitude < 0 { // Add more realistic altitude bounds
 			log.Printf("Invalid altitude value: %s. Must be positive.", valueStr)
 			return
@@ -407,6 +516,19 @@ func (g *Game) parseAndExecuteCommand(cmd string) {
 		} else {
 			log.Printf("Issued D %s to %s", waypointName, aircraftID)
 		}
+
+	case "HO", "HANDOFF":
+		if aircraftID != "" {
+			g.handleHandoffCommand(aircraftID)
+		} else {
+			log.Printf("Invalid HANDOFF command. Usage: HO <callsign>")
+		}
+	case "LAND", "LANDING":
+		if aircraftID != "" && strings.HasPrefix(valueStr, "RWY") {
+			g.handleLandingCommand(aircraftID, valueStr)
+		} else {
+			log.Printf("Invalid LAND command. Usage: LAND <callsign> RWY<number>")
+		}
 	default:
 		log.Printf("Unknown command type: %s", commandType)
 	}
@@ -415,8 +537,8 @@ func (g *Game) parseAndExecuteCommand(cmd string) {
 func main() {
 	ebiten.SetWindowSize(1280, 720)
 	ebiten.SetWindowTitle("ATC Simulator")
-	ebiten.SetVsyncEnabled(true)
-	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
+	// ebiten.SetVsyncEnabled(true)
+	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeDisabled)
 
 	game := NewGame(1280, 720)
 

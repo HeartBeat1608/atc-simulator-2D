@@ -11,6 +11,8 @@ import (
 	"math/rand"
 	"slices"
 	"time"
+
+	"github.com/hajimehoshi/ebiten/v2"
 )
 
 type Simulation struct {
@@ -20,9 +22,11 @@ type Simulation struct {
 	TimeOfDay       time.Time
 	GameTimeSeconds float64
 
-	HandOffs        int
-	MissedHandoffs  int
-	Conflicts       int
+	HandOffs       int
+	MissedHandoffs int
+	Conflicts      int
+	Landings       int
+
 	RadioLog        []RadioMessage
 	maxRadioLogSize int
 
@@ -30,10 +34,29 @@ type Simulation struct {
 	spawnInterval        time.Duration
 	nextAircraftID       int
 	maxAircraftsOnScreen int
+	landingProbability   float64
+
+	WorldToScreen func(wx float64, wy float64) (sx float64, sy float64)
+	ScreenToWorld func(wx float64, wy float64) (sx float64, sy float64)
 }
 
 func NewSimulation(tickRate float64) *Simulation {
 	simpleAirspace := airspace.NewAirspace()
+
+	kiaAirport := airspace.Airport{
+		ID:       "KBLR",
+		Name:     "Kempegowda International Airport",
+		Position: types.NewVec2(512, 384),
+		Runways: map[string]*airspace.Runway{
+			"RWY09": {Name: "RWY09", Threshold: types.NewVec2(200, 384), Heading: 90},
+			"RWY27": {Name: "RWY09", Threshold: types.NewVec2(824, 384), Heading: 270},
+		},
+	}
+
+	simpleAirspace.AddAirport(kiaAirport.ID, kiaAirport.Name, kiaAirport.Position, []airspace.Runway{
+		*kiaAirport.Runways["RWY09"],
+		*kiaAirport.Runways["RWY27"],
+	})
 
 	s := &Simulation{
 		Aircrafts: make(map[types.AircraftID]*aircraft.Aircraft),
@@ -46,6 +69,7 @@ func NewSimulation(tickRate float64) *Simulation {
 		nextAircraftID:       100,
 		maxAircraftsOnScreen: 5,
 		maxRadioLogSize:      50,
+		landingProbability:   0.8,
 
 		HandOffs:       0,
 		MissedHandoffs: 0,
@@ -58,28 +82,43 @@ func NewSimulation(tickRate float64) *Simulation {
 
 func (s *Simulation) Update(dt float64) {
 	s.GameTimeSeconds += dt
-	for _, ac := range s.Aircrafts {
+	for id, ac := range s.Aircrafts {
 		ac.Update(dt)
 		ac.IsConflicting = false
 
 		if ac.FlightPlan != nil && ac.FlightPlan.CurrentSegmentIndex >= len(ac.FlightPlan.Route) {
-			isAtExit := false
-			for _, exitWpName := range s.Airspace.ExitWaypoints {
-				if exitWp, ok := s.Airspace.Waypoints[exitWpName]; ok {
-					if ac.Position.DistanceTo(exitWp.Position) < 50 {
-						isAtExit = true
-						break
+			if ac.State == aircraft.LANDED {
+				if _, exists := s.Aircrafts[id]; exists {
+					s.LandAircraft(id)
+					delete(s.Aircrafts, id)
+				}
+			} else if ac.ClearedForHandoff {
+				isAtExit := false
+				for _, exitWpName := range s.Airspace.ExitWaypoints {
+					if exitWp, ok := s.Airspace.Waypoints[exitWpName]; ok {
+						if ac.Position.DistanceTo(exitWp.Position) < 50 {
+							isAtExit = true
+							break
+						}
 					}
 				}
-			}
 
-			if isAtExit {
-				s.HandOffAircraft(ac.ID)
-			} else {
-				// Aircraft completed plan but not at exit. Could be a holding pattern or error condition.
-				// For now, it will just keep flying straight. Later, make it hold or get penalized.
-				continue
+				if isAtExit {
+					s.HandOffAircraft(ac.ID)
+					continue
+				}
+			} else if ac.ClearedForLanding {
+				if ac.State == aircraft.LANDED {
+					s.LandAircraft(ac.ID)
+					continue
+				}
 			}
+		} else {
+			// Aircraft completed plan but not cleared for handoff/landing.
+			// This is where a penalty could occur later if it leaves the zone.
+			// For now, it will just keep flying straight until CleanupAircraft gets it.
+			// Or, the aircraft might start requesting guidance here.
+			continue
 		}
 	}
 	s.CheckForConflicts()
@@ -96,6 +135,59 @@ func (s *Simulation) Update(dt float64) {
 	s.CleanupAircraft()
 }
 
+func (s *Simulation) ClearLanding(aircraftID types.AircraftID, runwayName string) bool {
+	ac, ok := s.Aircrafts[aircraftID]
+	if !ok {
+		log.Printf("ClearLanding: Aircraft %s not found.", aircraftID)
+		return false
+	}
+
+	var targetRunway *airspace.Runway
+	for _, airport := range s.Airspace.Airports {
+		if rwy, found := airport.Runways[runwayName]; found {
+			targetRunway = rwy
+			break
+		}
+	}
+
+	if targetRunway == nil {
+		s.AddRadioMessage("ATC", fmt.Sprintf("Negative, %s, runway %s is not valid.", ac.ID, runwayName), true)
+		return false // Runway not found
+	}
+
+	if ac.ClearedForLanding {
+		// Already cleared, confirm it
+		s.AddRadioMessage("ATC", fmt.Sprintf("Confirming landing clearance for %s on %s.", ac.ID, runwayName), false)
+		return true
+	}
+
+	landingSegment := flightplan.FlightPlanSegment{
+		Type:           flightplan.SegmentTypeLanding,
+		AirportID:      targetRunway.AirportID, // Assuming AirportID for runway is its name for simplicity,
+		RunwayName:     targetRunway.Name,      // Or you might use Airport.ID here
+		TargetAltitude: 2000,                   // Standard approach altitude
+		TargetSpeed:    200,                    // Standard approach speed
+	}
+
+	ac.FlightPlan.Route = []flightplan.FlightPlanSegment{landingSegment}
+	ac.FlightPlan.CurrentSegmentIndex = 0 // Reset to start new plan
+
+	ac.LandingRunway = targetRunway
+	ac.ClearedForLanding = true
+	ac.PreviousAltitudeRequest = false
+	ac.PreviousSpeedRequest = false
+
+	s.AddRadioMessage("ATC", fmt.Sprintf("%s, cleared for ILS approach runway %s.", ac.ID, runwayName), false)
+	return true
+}
+
+func (s *Simulation) LandAircraft(aircraftID types.AircraftID) {
+	if ac, ok := s.Aircrafts[aircraftID]; ok {
+		log.Printf("SCORE: Aircraft %s successfully landed.", ac.ID)
+		s.Landings++
+	}
+}
+
 func (s *Simulation) HandOffAircraft(aircraftID types.AircraftID) {
 	if ac, ok := s.Aircrafts[aircraftID]; ok {
 		s.AddRadioMessage(ac.ID, "Good day, contact next controller.", false)
@@ -110,15 +202,11 @@ func (s *Simulation) randomFloatInRange(minF, maxF float64) float64 {
 	return minF + rand.Float64()*fRange
 }
 
-func (s *Simulation) getWaypoint(waypoint string) (*types.Waypoint, bool) {
-	wp, ok := s.Airspace.Waypoints[waypoint]
-	return wp, ok
-}
-
 func (s *Simulation) SpawnRandomAircraft() {
 	// Define spawn points (e.g., edges of your 1024x768 screen)
-	minX, maxX := 10.0, 1024.0
-	minY, maxY := 10.0, 768.0
+	screenWidth, screenHeight := ebiten.WindowSize()
+	minX, maxX := 100.0, float64(screenWidth)-100.0
+	minY, maxY := 100.0, float64(screenHeight)-100.0
 
 	var startPos types.Vec2
 	acID := types.AircraftID(fmt.Sprintf("%s%03d", getRandomAirlinePrefix(), s.nextAircraftID))
@@ -174,39 +262,66 @@ func (s *Simulation) SpawnRandomAircraft() {
 		},
 	}
 
-	waypointNames := make([]string, 0, len(s.Airspace.Waypoints))
-	addedWaypoints := make([]string, 0)
-	for k := range s.Airspace.Waypoints {
-		waypointNames = append(waypointNames, k)
-	}
-	retries := 8
-	for len(flightPlanSegments) < 3 {
-		wpName := waypointNames[rand.Intn(len(waypointNames))]
-		if wpName == entryWpName || wpName == exitWpName || slices.Contains(addedWaypoints, wpName) {
-			retries--
-			if retries <= 0 {
-				break
-			}
-			continue
+	isLandingAircraft := rand.Float64() < s.landingProbability
+	if isLandingAircraft {
+		waypointNames := make([]string, 0, len(s.Airspace.Waypoints))
+		addedWaypoints := make([]string, 0)
+		for k := range s.Airspace.Waypoints {
+			waypointNames = append(waypointNames, k)
 		}
+		retries := 8
+		for len(flightPlanSegments) < 2 {
+			wpName := waypointNames[rand.Intn(len(waypointNames))]
+			if wpName == entryWpName || wpName == exitWpName || slices.Contains(addedWaypoints, wpName) {
+				retries--
+				if retries <= 0 {
+					break
+				}
+				continue
+			}
 
-		flightPlanSegments = append(flightPlanSegments, flightplan.FlightPlanSegment{
-			WaypointName:   wpName,
-			TargetAltitude: targetAlt * (rand.Float64()/2 + 0.75),
-			TargetSpeed:    startSpeed * (rand.Float64()/2 + 0.75),
-		})
-		addedWaypoints = append(addedWaypoints, wpName)
+			flightPlanSegments = append(flightPlanSegments, flightplan.FlightPlanSegment{
+				WaypointName:   wpName,
+				TargetAltitude: targetAlt * (rand.Float64()/2 + 0.75),
+				TargetSpeed:    startSpeed * (rand.Float64()/2 + 0.75),
+			})
+			addedWaypoints = append(addedWaypoints, wpName)
+		}
 	}
 
-	flightPlanSegments = append(flightPlanSegments, flightplan.FlightPlanSegment{
+	fpLastSegment := flightplan.FlightPlanSegment{
 		WaypointName:   exitWpName,
 		TargetAltitude: targetAlt * (rand.Float64()/2 + 0.75),
 		TargetSpeed:    startSpeed * (rand.Float64()/2 + 0.75),
-	})
+	}
+
+	if isLandingAircraft && len(s.Airspace.Airports) > 0 {
+		airportIDs := make([]string, 0, len(s.Airspace.Airports))
+		for id := range s.Airspace.Airports {
+			airportIDs = append(airportIDs, id)
+		}
+
+		targetAirportID := airportIDs[rand.Intn(len(airportIDs))]
+		targetAirport := s.Airspace.Airports[targetAirportID]
+
+		runwaysNames := make([]string, 0, len(targetAirport.Runways))
+		for name := range targetAirport.Runways {
+			runwaysNames = append(runwaysNames, name)
+		}
+		targetRunwayName := runwaysNames[rand.Intn(len(runwaysNames))]
+
+		fpLastSegment.RunwayName = targetRunwayName
+		fpLastSegment.AirportID = targetAirportID
+		fpLastSegment.Type = flightplan.SegmentTypeLanding
+		fpLastSegment.TargetAltitude = 2000
+		fpLastSegment.TargetSpeed = 225
+	}
+
+	flightPlanSegments = append(flightPlanSegments, fpLastSegment)
 
 	flightPlan := &flightplan.FlightPlan{
 		OriginAirportID:      "RANDOM",
-		DestinationAirportID: exitWpName,
+		DestinationAirportID: fpLastSegment.WaypointName,
 		Callsign:             acID,
 		Route:                flightPlanSegments,
 		CurrentSegmentIndex:  0,
@@ -220,7 +335,7 @@ func (s *Simulation) SpawnRandomAircraft() {
 		targetAlt,
 		aircraft.CRUISE,
 		flightPlan,
-		s.getWaypoint,
+		s.Airspace,
 		s.AddRadioMessage,
 	)
 	s.Aircrafts[acID] = ac
@@ -252,11 +367,24 @@ func (s *Simulation) CheckForConflicts() {
 }
 
 func (s *Simulation) CleanupAircraft() {
-	minX, maxX := -50.0, 1074.0 // Slightly outside screen
-	minY, maxY := -50.0, 818.0
+	screenWidth, screenHeight := ebiten.WindowSize()
+	buffer := 100.0
+
+	worldLeft, worldTop := s.ScreenToWorld(0, 0)
+	worldRight, worldBottom := s.ScreenToWorld(float64(screenWidth), float64(screenHeight))
+
+	worldMinX := worldLeft - buffer
+	worldMinY := worldRight + buffer
+	worldMaxX := worldTop - buffer
+	worldMaxY := worldBottom + buffer
 
 	for id, ac := range s.Aircrafts {
-		if ac.Position.X < minX || ac.Position.X > maxX || ac.Position.Y < minY || ac.Position.Y > maxY {
+		if time.Since(ac.SpawnTime) < time.Minute || ac.DirectToWaypoint != nil {
+			// skip cleanup for first 1 minute of ops (avoids unnecessary checks)
+			continue
+		}
+
+		if ac.Position.X < worldMinX || ac.Position.X > worldMaxX || ac.Position.Y < worldMinY || ac.Position.Y > worldMaxY || ac.State != aircraft.LANDED {
 			// Only count as missed handoff if it wasn't already handed off
 			// You'll need a mechanism to check if it was 'expected' to be handed off.
 			// For simplicity, for now, any exit without HandOffAircraft call is a "missed".
@@ -276,6 +404,9 @@ func (s *Simulation) CleanupAircraft() {
 func (s *Simulation) IssueHeading(aircraftID types.AircraftID, heading float64) error {
 	if ac, ok := s.Aircrafts[aircraftID]; ok {
 		ac.SetHeading(heading)
+		if ac.DirectToWaypoint != nil {
+			ac.DirectToWaypoint = nil
+		}
 		return nil
 	}
 	return fmt.Errorf("aircraft %s not found", aircraftID)
@@ -299,8 +430,45 @@ func (s *Simulation) IssueSpeed(aircraftID types.AircraftID, speed float64) erro
 
 func (s *Simulation) IssueDirectTo(aircraftID types.AircraftID, wp *types.Waypoint) error {
 	if ac, ok := s.Aircrafts[aircraftID]; ok {
+		if ac.FlightPlan != nil && ac.FlightPlan.CurrentSegmentIndex < len(ac.FlightPlan.Route) {
+			wpIdx := -1
+			for i, r := range ac.FlightPlan.Route {
+				if r.WaypointName == wp.Name {
+					wpIdx = i
+					break
+				}
+			}
+
+			if wpIdx != -1 {
+				ac.FlightPlan.CurrentSegmentIndex = wpIdx
+			}
+		}
+
 		ac.SetDirectTo(wp)
 		return nil
 	}
 	return fmt.Errorf("aircraft %s not found", aircraftID)
+}
+
+func (s *Simulation) ClearHandoff(aircraftID types.AircraftID) bool {
+	ac, ok := s.Aircrafts[aircraftID]
+	if !ok {
+		log.Printf("ClearHandoff: Aircraft %s not found.", aircraftID)
+		return false
+	}
+
+	if ac.FlightPlan == nil || ac.FlightPlan.CurrentSegmentIndex < len(ac.FlightPlan.Route) {
+		s.AddRadioMessage("ATC", fmt.Sprintf("Negative, %s, you are not ready for handoff.", ac.ID), true)
+		return false // Not at end of flight plan yet
+	}
+
+	if ac.ClearedForHandoff {
+		s.AddRadioMessage("ATC", fmt.Sprintf("Confirming handoff clearance for %s, you are already cleared.", ac.ID), false)
+		return true // Already cleared, no change
+	}
+
+	ac.ClearedForHandoff = true
+
+	s.AddRadioMessage("ATC", fmt.Sprintf("%s, contact departure, good day.", ac.ID), false)
+	return true
 }
